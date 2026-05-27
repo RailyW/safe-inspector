@@ -1,0 +1,10 @@
+# Go 构建产物
+/safe-inspector
+/safe-inspector.exe
+
+# Go 测试产物
+*.test
+*.out
+
+# 本地临时目录
+/.tmp/
