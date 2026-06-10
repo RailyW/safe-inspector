@@ -24,6 +24,10 @@ const (
 
 	DefaultTimeoutSeconds = 30
 	DefaultMaxOutputBytes = 1024 * 1024
+
+	AdhocRiskLow                 = "low"
+	SSHAdhocProfileObservability = "observability-v1"
+	DBAdhocProfileReadOnly       = "readonly-v1"
 )
 
 // Paths 描述 safe-inspector 在本机使用的所有配置文件路径。
@@ -52,27 +56,39 @@ type Config struct {
 
 // SSHTarget 是一台被允许连接的 SSH 机器的非敏感配置。
 type SSHTarget struct {
-	ID                    string `json:"id" yaml:"id"`
-	Host                  string `json:"host" yaml:"host"`
-	Port                  int    `json:"port" yaml:"port"`
-	User                  string `json:"user" yaml:"user"`
-	AuthType              string `json:"auth_type" yaml:"auth_type"`
-	KeyPath               string `json:"key_path,omitempty" yaml:"key_path,omitempty"`
-	AllowSudo             bool   `json:"allow_sudo" yaml:"allow_sudo"`
-	DefaultTimeoutSeconds int    `json:"default_timeout_seconds" yaml:"default_timeout_seconds"`
-	MaxOutputBytes        int64  `json:"max_output_bytes" yaml:"max_output_bytes"`
+	ID                    string      `json:"id" yaml:"id"`
+	Host                  string      `json:"host" yaml:"host"`
+	Port                  int         `json:"port" yaml:"port"`
+	User                  string      `json:"user" yaml:"user"`
+	AuthType              string      `json:"auth_type" yaml:"auth_type"`
+	KeyPath               string      `json:"key_path,omitempty" yaml:"key_path,omitempty"`
+	AllowSudo             bool        `json:"allow_sudo" yaml:"allow_sudo"`
+	DefaultTimeoutSeconds int         `json:"default_timeout_seconds" yaml:"default_timeout_seconds"`
+	MaxOutputBytes        int64       `json:"max_output_bytes" yaml:"max_output_bytes"`
+	AdhocPolicy           AdhocPolicy `json:"adhoc_policy,omitempty" yaml:"adhoc_policy,omitempty"`
 }
 
 // DBTarget 是一个被允许连接的数据库的非敏感配置。
 type DBTarget struct {
-	ID                    string `json:"id" yaml:"id"`
-	Driver                string `json:"driver" yaml:"driver"`
-	Host                  string `json:"host" yaml:"host"`
-	Port                  int    `json:"port" yaml:"port"`
-	Database              string `json:"database" yaml:"database"`
-	Username              string `json:"username" yaml:"username"`
-	DefaultTimeoutSeconds int    `json:"default_timeout_seconds" yaml:"default_timeout_seconds"`
-	MaxOutputBytes        int64  `json:"max_output_bytes" yaml:"max_output_bytes"`
+	ID                    string      `json:"id" yaml:"id"`
+	Driver                string      `json:"driver" yaml:"driver"`
+	Host                  string      `json:"host" yaml:"host"`
+	Port                  int         `json:"port" yaml:"port"`
+	Database              string      `json:"database" yaml:"database"`
+	Username              string      `json:"username" yaml:"username"`
+	DefaultTimeoutSeconds int         `json:"default_timeout_seconds" yaml:"default_timeout_seconds"`
+	MaxOutputBytes        int64       `json:"max_output_bytes" yaml:"max_output_bytes"`
+	AdhocPolicy           AdhocPolicy `json:"adhoc_policy,omitempty" yaml:"adhoc_policy,omitempty"`
+}
+
+// AdhocPolicy 描述某个目标是否允许低风险临时执行。
+//
+// 该策略是目标级显式授权：旧配置的零值必须保持 disabled，避免升级后
+// 自动扩大生产环境访问权限。启用后第一版仅支持 max_risk=low。
+type AdhocPolicy struct {
+	Enabled bool   `json:"enabled" yaml:"enabled"`
+	MaxRisk string `json:"max_risk,omitempty" yaml:"max_risk,omitempty"`
+	Profile string `json:"profile,omitempty" yaml:"profile,omitempty"`
 }
 
 // SSHTemplate 是某台 SSH 机器允许执行的一条命令模板。
@@ -288,6 +304,38 @@ func (c Config) FindDBTemplate(targetID string, name string) (DBTemplate, bool) 
 		}
 	}
 	return DBTemplate{}, false
+}
+
+// NormalizedAdhocPolicy 返回 SSH 目标的临时执行策略。
+//
+// 当策略未启用时保持完全关闭；当用户显式启用但省略 max_risk/profile 时，
+// 使用 SSH 观测命令的保守默认值。
+func (t SSHTarget) NormalizedAdhocPolicy() AdhocPolicy {
+	return normalizeAdhocPolicy(t.AdhocPolicy, SSHAdhocProfileObservability)
+}
+
+// NormalizedAdhocPolicy 返回 DB 目标的临时执行策略。
+//
+// 当策略未启用时保持完全关闭；当用户显式启用但省略 max_risk/profile 时，
+// 使用 MySQL 只读查询的保守默认值。
+func (t DBTarget) NormalizedAdhocPolicy() AdhocPolicy {
+	return normalizeAdhocPolicy(t.AdhocPolicy, DBAdhocProfileReadOnly)
+}
+
+// normalizeAdhocPolicy 补齐启用状态下的默认风险等级和 profile。
+//
+// 这里特意不在 disabled 时补默认值，避免配置序列化后看起来像已经放权。
+func normalizeAdhocPolicy(policy AdhocPolicy, defaultProfile string) AdhocPolicy {
+	if !policy.Enabled {
+		return AdhocPolicy{}
+	}
+	if policy.MaxRisk == "" {
+		policy.MaxRisk = AdhocRiskLow
+	}
+	if policy.Profile == "" {
+		policy.Profile = defaultProfile
+	}
+	return policy
 }
 
 // EmptySecrets 返回初始化后的空 secret map，避免调用方处理 nil map。

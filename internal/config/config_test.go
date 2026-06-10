@@ -27,6 +27,9 @@ func TestStoreInitCreatesConfigSecretsAndAuditFiles(t *testing.T) {
 	if cfg.Version != 1 {
 		t.Fatalf("config version mismatch: %d", cfg.Version)
 	}
+	if len(cfg.SSHTargets) != 0 || len(cfg.DBTargets) != 0 {
+		t.Fatalf("new config should not contain targets: %#v", cfg)
+	}
 	if !cfg.MasterKey.Verify("master-key") {
 		t.Fatalf("stored master key verifier rejected the original key")
 	}
@@ -51,5 +54,23 @@ func TestStoreLoadSecretsRejectsWrongMasterKey(t *testing.T) {
 
 	if _, err := store.LoadSecrets("wrong-key"); err == nil {
 		t.Fatalf("LoadSecrets accepted a wrong master key")
+	}
+}
+
+func TestAdhocPolicyDefaultsToDisabledForOldTargets(t *testing.T) {
+	sshTarget := SSHTarget{ID: "prod-ssh"}
+	if sshTarget.AdhocPolicy.Enabled {
+		t.Fatalf("zero-value SSH adhoc policy must be disabled")
+	}
+	if sshTarget.NormalizedAdhocPolicy().Enabled {
+		t.Fatalf("normalized zero-value SSH adhoc policy must stay disabled")
+	}
+
+	dbTarget := DBTarget{ID: "prod-db"}
+	if dbTarget.AdhocPolicy.Enabled {
+		t.Fatalf("zero-value DB adhoc policy must be disabled")
+	}
+	if dbTarget.NormalizedAdhocPolicy().Enabled {
+		t.Fatalf("normalized zero-value DB adhoc policy must stay disabled")
 	}
 }

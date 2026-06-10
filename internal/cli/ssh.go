@@ -12,13 +12,19 @@ import (
 	"github.com/RailyW/safe-inspector/internal/audit"
 	"github.com/RailyW/safe-inspector/internal/config"
 	"github.com/RailyW/safe-inspector/internal/policy"
+	"github.com/RailyW/safe-inspector/internal/risk"
 	"github.com/RailyW/safe-inspector/internal/safetemplate"
 	"github.com/RailyW/safe-inspector/internal/sshclient"
 )
 
+// sshExecute 是 SSH 实际执行函数的注入点。
+//
+// 生产环境默认调用 sshclient.Execute；测试会替换它，避免连接真实机器。
+var sshExecute = sshclient.Execute
+
 func runSSH(store config.Store, opts globalOptions, args []string, stdout io.Writer, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "ssh 缺少子命令：add、template add、exec")
+		fmt.Fprintln(stderr, "ssh 缺少子命令：add、template add、exec、run、risk")
 		return 2
 	}
 	switch args[0] {
@@ -32,6 +38,10 @@ func runSSH(store config.Store, opts globalOptions, args []string, stdout io.Wri
 		return 2
 	case "exec":
 		return runSSHExec(store, opts, args[1:], stdout, stderr)
+	case "run":
+		return runSSHRun(store, opts, args[1:], stdout, stderr)
+	case "risk":
+		return runSSHRisk(store, opts, args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "未知 ssh 子命令: %s\n", args[0])
 		return 2
@@ -48,6 +58,7 @@ func runSSHAdd(store config.Store, opts globalOptions, args []string, stdout io.
 	authType := fs.String("auth", "password", "认证类型：password 或 key")
 	keyPath := fs.String("key-path", "", "SSH 私钥路径")
 	allowSudo := fs.Bool("allow-sudo", false, "是否允许 sudo 模板")
+	allowAdhocLowRisk := fs.Bool("allow-adhoc-low-risk", false, "是否允许低风险观测命令临时执行")
 	withKeyPassphrase := fs.Bool("with-key-passphrase", false, "是否提示输入 SSH 私钥 passphrase")
 	timeoutSeconds := fs.Int("timeout", config.DefaultTimeoutSeconds, "默认超时秒数")
 	maxOutputBytes := fs.Int64("max-output", config.DefaultMaxOutputBytes, "默认最大输出字节数")
@@ -94,6 +105,10 @@ func runSSHAdd(store config.Store, opts globalOptions, args []string, stdout io.
 		}
 	}
 
+	adhocPolicy := config.AdhocPolicy{}
+	if *allowAdhocLowRisk {
+		adhocPolicy = config.AdhocPolicy{Enabled: true, MaxRisk: config.AdhocRiskLow, Profile: config.SSHAdhocProfileObservability}
+	}
 	cfg.SSHTargets = append(cfg.SSHTargets, config.SSHTarget{
 		ID:                    *id,
 		Host:                  *host,
@@ -104,6 +119,7 @@ func runSSHAdd(store config.Store, opts globalOptions, args []string, stdout io.
 		AllowSudo:             *allowSudo,
 		DefaultTimeoutSeconds: defaultTimeoutSeconds(*timeoutSeconds),
 		MaxOutputBytes:        defaultMaxOutputBytes(*maxOutputBytes),
+		AdhocPolicy:           adhocPolicy,
 	})
 	secrets.SSH[*id] = secret
 	if err := store.SaveSecrets(masterKey, secrets); err != nil {
@@ -219,6 +235,143 @@ func runSSHExec(store config.Store, opts globalOptions, args []string, stdout io
 		return 1
 	}
 	return 0
+}
+
+// runSSHRisk 只解释 SSH 命令风险，不连接远程机器。
+//
+// 该命令用于 agent 在执行前探测边界：低风险说明可以尝试 ssh run；
+// 中风险会返回模板审批建议；高风险/关键风险会返回拒绝原因。
+func runSSHRisk(store config.Store, opts globalOptions, args []string, stdout io.Writer, stderr io.Writer) int {
+	fs := flag.NewFlagSet("ssh risk", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	targetID := fs.String("target", "", "SSH 目标 ID")
+	command := fs.String("command", "", "待评估的 SSH 命令")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	start := time.Now()
+	cfg, err := store.LoadConfig()
+	if err != nil {
+		return writeError(stderr, err)
+	}
+	if _, ok := cfg.FindSSHTarget(*targetID); !ok {
+		return writeError(stderr, fmt.Errorf("SSH 目标 %q 不存在", *targetID))
+	}
+	assessment := risk.ClassifySSHCommand(*command)
+	response := map[string]any{"ok": true, "target": *targetID, "duration_ms": time.Since(start).Milliseconds()}
+	addRiskFields(response, assessment)
+	if assessment.Decision == risk.DecisionTemplateRequired {
+		response["suggested_approval_command"] = suggestedSSHTemplateCommand(*targetID, *command)
+	}
+	auditID := writeAudit(store, audit.Event{
+		Action:      "ssh.risk",
+		Target:      *targetID,
+		Params:      map[string]string{"command_sha256": hashSummary(*command)},
+		RiskLevel:   string(assessment.Level),
+		Decision:    string(assessment.Decision),
+		RiskReasons: assessment.Reasons,
+		OK:          true,
+		DurationMS:  time.Since(start).Milliseconds(),
+	})
+	response["audit_id"] = auditID
+	return writeValue(stdout, opts.Format, response)
+}
+
+// runSSHRun 执行低风险 SSH 临时命令。
+//
+// 它先进行确定性风险分级：只有低风险 allow 且目标开启 adhoc_policy 时才会
+// 解密认证信息并连接远程机器；中风险和高风险都不会连接远程机器。
+func runSSHRun(store config.Store, opts globalOptions, args []string, stdout io.Writer, stderr io.Writer) int {
+	fs := flag.NewFlagSet("ssh run", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	targetID := fs.String("target", "", "SSH 目标 ID")
+	command := fs.String("command", "", "待执行的 SSH 命令")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	start := time.Now()
+	cfg, err := store.LoadConfig()
+	if err != nil {
+		return writeError(stderr, err)
+	}
+	target, ok := cfg.FindSSHTarget(*targetID)
+	if !ok {
+		return writeError(stderr, fmt.Errorf("SSH 目标 %q 不存在", *targetID))
+	}
+	assessment := risk.ClassifySSHCommand(*command)
+	if assessment.Decision == risk.DecisionTemplateRequired {
+		return writeSSHAdhocDecision(store, opts, stdout, start, target.ID, *command, assessment, suggestedSSHTemplateCommand(target.ID, *command), 0)
+	}
+	if assessment.Decision == risk.DecisionDeny {
+		return writeSSHAdhocDecision(store, opts, stdout, start, target.ID, *command, assessment, "", 1)
+	}
+	adhocPolicy := target.NormalizedAdhocPolicy()
+	if !adhocPolicy.Enabled {
+		assessment = deniedByAdhocPolicy(assessment, "目标未开启 adhoc_policy，低风险临时执行被拒绝")
+		return writeSSHAdhocDecision(store, opts, stdout, start, target.ID, *command, assessment, "", 1)
+	}
+	if !risk.Allows(adhocPolicy.MaxRisk, assessment.Level) {
+		assessment = deniedByAdhocPolicy(assessment, fmt.Sprintf("目标 adhoc_policy 只允许最高风险等级 %s", adhocPolicy.MaxRisk))
+		return writeSSHAdhocDecision(store, opts, stdout, start, target.ID, *command, assessment, "", 1)
+	}
+
+	secrets, _, err := loadExecutionSecrets(store)
+	if err != nil {
+		return writeError(stderr, err)
+	}
+	result, execErr := sshExecute(context.Background(), target, secrets.SSH[target.ID], *command, false, time.Duration(defaultTimeoutSeconds(target.DefaultTimeoutSeconds))*time.Second, defaultMaxOutputBytes(target.MaxOutputBytes))
+	response := map[string]any{
+		"ok":          execErr == nil,
+		"target":      target.ID,
+		"duration_ms": time.Since(start).Milliseconds(),
+		"stdout":      result.Stdout,
+		"stderr":      result.Stderr,
+		"exit_code":   result.ExitCode,
+		"truncated":   result.Truncated,
+	}
+	addRiskFields(response, assessment)
+	if execErr != nil {
+		response["error"] = execErr.Error()
+	}
+	auditID := writeAudit(store, audit.Event{
+		Action:      "ssh.run",
+		Target:      target.ID,
+		Params:      map[string]string{"command_sha256": hashSummary(*command)},
+		RiskLevel:   string(assessment.Level),
+		Decision:    string(assessment.Decision),
+		RiskReasons: assessment.Reasons,
+		OK:          execErr == nil,
+		DurationMS:  time.Since(start).Milliseconds(),
+		ErrorClass:  errorClass(execErr),
+	})
+	response["audit_id"] = auditID
+	writeValue(stdout, opts.Format, response)
+	if execErr != nil {
+		return 1
+	}
+	return 0
+}
+
+// writeSSHAdhocDecision 输出未执行 SSH 命令时的结构化风险结果并写审计。
+func writeSSHAdhocDecision(store config.Store, opts globalOptions, stdout io.Writer, start time.Time, targetID string, command string, assessment risk.Assessment, suggestion string, exitCode int) int {
+	response := map[string]any{"ok": false, "target": targetID, "duration_ms": time.Since(start).Milliseconds()}
+	addRiskFields(response, assessment)
+	if suggestion != "" {
+		response["suggested_approval_command"] = suggestion
+	}
+	auditID := writeAudit(store, audit.Event{
+		Action:      "ssh.run",
+		Target:      targetID,
+		Params:      map[string]string{"command_sha256": hashSummary(command)},
+		RiskLevel:   string(assessment.Level),
+		Decision:    string(assessment.Decision),
+		RiskReasons: assessment.Reasons,
+		OK:          false,
+		DurationMS:  time.Since(start).Milliseconds(),
+	})
+	response["audit_id"] = auditID
+	writeValue(stdout, opts.Format, response)
+	return exitCode
 }
 
 func loadSSHTemplateFromFlags(fromFile string, targetID string, name string, command string, sudo bool, timeoutSeconds int, maxOutputBytes int64, description string, params []string) (config.SSHTemplate, error) {

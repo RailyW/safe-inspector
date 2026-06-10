@@ -199,15 +199,20 @@ func HelpText() string {
   ssh add                      添加 SSH 目标
   ssh template add             为 SSH 目标添加安全命令模板
   ssh exec                     执行已批准的 SSH 命令模板
+  ssh risk                     评估 SSH 临时命令风险，不连接远程机器
+  ssh run                      执行低风险 SSH 临时命令
   db add                       添加 MySQL 目标
   db template add              为 MySQL 目标添加安全 SQL 模板
   db exec                      执行已批准的 SQL 模板
+  db risk                      评估 SQL 临时查询风险，不连接数据库
+  db query                     执行低风险只读 SQL 临时查询
 
 关键约束:
   - 默认输出 JSON，可用 --format text 切换人工可读输出。
   - 执行命令只读取 SAFE_INSPECTOR_MASTER_KEY 做内部解密，不输出认证信息。
   - 新增目标和模板必须在交互式终端输入主秘钥。
-  - SSH 不做额外危险命令拦截，安全边界来自用户审批过的模板。
+  - 临时执行必须由目标显式开启 --allow-adhoc-low-risk，且只允许低风险动作。
+  - 中风险临时动作只返回 suggested_approval_command，不会连接生产资源。
   - MySQL 默认只读，写入必须使用 kind=write 模板，DDL/DCL 和多语句始终拒绝。
 `
 }
@@ -215,14 +220,15 @@ func HelpText() string {
 func SkillsText() string {
 	return `# safe-inspector CLI skills
 
-你是大语言模型时，应把 safe-inspector 当成只读优先、模板受控的生产环境访问工具。
+你是大语言模型时，应把 safe-inspector 当成只读优先、低风险可临时执行、越界转模板审批的生产环境访问工具。
 
 ## 基本原则
 
 - 不要输出密码、SSH 私钥 passphrase、sudo 密码、MySQL 密码或主秘钥。
-- 不要尝试绕过安全模板；只能执行已经存在的模板。
-- 如果用户请求的新 SSH 命令或 SQL 没有模板，你只能生成待用户复制执行的审批命令，不能自行执行审批。
-- 执行命令默认返回 JSON，优先解析 ` + "`ok`" + `、` + "`error`" + `、` + "`stdout`" + `、` + "`result`" + `、` + "`audit_id`" + ` 字段。
+- 不要尝试绕过风险分级或安全模板。
+- 对新需求，优先使用 ` + "`ssh run`" + ` 或 ` + "`db query`" + `；如果返回 ` + "`decision=template_required`" + `，把 ` + "`suggested_approval_command`" + ` 展示给用户，让用户自己在终端审批。
+- 如果返回 ` + "`decision=deny`" + `，停止执行并向用户解释 ` + "`risk_reasons`" + `。
+- 执行命令默认返回 JSON，优先解析 ` + "`ok`" + `、` + "`decision`" + `、` + "`risk_level`" + `、` + "`risk_reasons`" + `、` + "`error`" + `、` + "`stdout`" + `、` + "`result`" + `、` + "`audit_id`" + ` 字段。
 
 ## 查看状态
 
@@ -230,10 +236,42 @@ func SkillsText() string {
 safe-inspector status
 ` + "```" + `
 
+## 优先尝试低风险 SSH 临时执行
+
+` + "```powershell" + `
+safe-inspector ssh run --target prod-web --command "systemctl status nginx --no-pager"
+` + "```" + `
+
+可能结果：
+
+- ` + "`decision=allow`" + `：命令已执行，读取 ` + "`stdout`" + ` / ` + "`stderr`" + `。
+- ` + "`decision=template_required`" + `：不要执行，向用户展示 ` + "`suggested_approval_command`" + `。
+- ` + "`decision=deny`" + `：不要执行，解释 ` + "`risk_reasons`" + `。
+
+只评估不执行：
+
+` + "```powershell" + `
+safe-inspector ssh risk --target prod-web --command "cat /var/log/app.log"
+` + "```" + `
+
 ## 执行已批准 SSH 模板
 
 ` + "```powershell" + `
 safe-inspector ssh exec --target prod-web --template service-status --param service=nginx
+` + "```" + `
+
+## 优先尝试低风险 MySQL 临时查询
+
+` + "```powershell" + `
+safe-inspector db query --target prod-mysql --sql "select count(*) as total from users"
+` + "```" + `
+
+写入 SQL 会返回 ` + "`template_required`" + ` 和审批建议；DROP/ALTER/TRUNCATE/CREATE/GRANT/REVOKE、多语句、文件函数会返回 ` + "`deny`" + `。
+
+只评估不执行：
+
+` + "```powershell" + `
+safe-inspector db risk --target prod-mysql --sql "update users set disabled = 1 where id = 42"
 ` + "```" + `
 
 ## 执行已批准 MySQL 模板
@@ -244,7 +282,7 @@ safe-inspector db exec --target prod-mysql --template find-user --param id=42
 
 ## 生成 SSH 模板审批命令
 
-当缺少模板时，输出给用户审核并手动执行：
+当临时执行返回 ` + "`template_required`" + ` 时，优先展示返回 JSON 中的 ` + "`suggested_approval_command`" + `。手写审批命令示例：
 
 ` + "```powershell" + `
 safe-inspector ssh template add --target prod-web --name service-status --command "systemctl status {{service}}" --param service:enum=nginx,mysql
@@ -252,7 +290,7 @@ safe-inspector ssh template add --target prod-web --name service-status --comman
 
 ## 生成 SQL 模板审批命令
 
-只读查询示例：
+只读查询模板示例：
 
 ` + "```powershell" + `
 safe-inspector db template add --target prod-mysql --name find-user --kind read --sql "select * from {{table}} where id = {{id}}" --param table:identifier --param id:int

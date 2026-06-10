@@ -4,11 +4,11 @@
 
 ## 包含文件
 
-- `policy.go`：实现 SQL 读写类型校验、DDL/DCL 拒绝、多语句拒绝、sudo 使用边界校验。
+- `policy.go`：实现 SQL 风险分级封装、SQL 模板读写类型校验、DDL/DCL 拒绝、多语句拒绝、sudo 使用边界校验。
 - `policy_test.go`：覆盖只读 SQL、显式写入 SQL、危险 SQL 拒绝、sudo 目标权限校验。
 
 ## 安全说明
 
-- SSH 命令完全信任已经由用户审批过的模板，不在本包内做额外危险命令拦截。
-- MySQL 第一版保留硬边界：默认只读，写入必须 `kind=write`，DDL/DCL 和多语句始终拒绝。
+- SSH 模板执行仍完全信任已经由用户审批过的模板；临时 SSH 命令风险分级放在 `internal/risk`。
+- MySQL 第一版保留硬边界：默认只读，写入必须 `kind=write`，DDL/DCL、多语句和文件函数始终拒绝。
 - sudo 需要目标机器和模板两边同时声明，避免“目标允许 sudo”被误解为所有模板自动提权。

@@ -13,12 +13,18 @@ import (
 	"github.com/RailyW/safe-inspector/internal/config"
 	"github.com/RailyW/safe-inspector/internal/dbclient"
 	"github.com/RailyW/safe-inspector/internal/policy"
+	"github.com/RailyW/safe-inspector/internal/risk"
 	"github.com/RailyW/safe-inspector/internal/safetemplate"
 )
 
+// dbExecute 是数据库实际执行函数的注入点。
+//
+// 生产环境默认调用 dbclient.Execute；测试会替换它，避免连接真实 MySQL。
+var dbExecute = dbclient.Execute
+
 func runDB(store config.Store, opts globalOptions, args []string, stdout io.Writer, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "db 缺少子命令：add、template add、exec")
+		fmt.Fprintln(stderr, "db 缺少子命令：add、template add、exec、query、risk")
 		return 2
 	}
 	switch args[0] {
@@ -32,6 +38,10 @@ func runDB(store config.Store, opts globalOptions, args []string, stdout io.Writ
 		return 2
 	case "exec":
 		return runDBExec(store, opts, args[1:], stdout, stderr)
+	case "query":
+		return runDBQuery(store, opts, args[1:], stdout, stderr)
+	case "risk":
+		return runDBRisk(store, opts, args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "未知 db 子命令: %s\n", args[0])
 		return 2
@@ -47,6 +57,7 @@ func runDBAdd(store config.Store, opts globalOptions, args []string, stdout io.W
 	port := fs.Int("port", 3306, "数据库端口")
 	database := fs.String("database", "", "数据库名")
 	username := fs.String("user", "", "数据库用户名")
+	allowAdhocLowRisk := fs.Bool("allow-adhoc-low-risk", false, "是否允许低风险只读 SQL 临时执行")
 	timeoutSeconds := fs.Int("timeout", config.DefaultTimeoutSeconds, "默认超时秒数")
 	maxOutputBytes := fs.Int64("max-output", config.DefaultMaxOutputBytes, "默认最大输出字节数")
 	if err := fs.Parse(args); err != nil {
@@ -75,6 +86,10 @@ func runDBAdd(store config.Store, opts globalOptions, args []string, stdout io.W
 	if err != nil {
 		return writeError(stderr, err)
 	}
+	adhocPolicy := config.AdhocPolicy{}
+	if *allowAdhocLowRisk {
+		adhocPolicy = config.AdhocPolicy{Enabled: true, MaxRisk: config.AdhocRiskLow, Profile: config.DBAdhocProfileReadOnly}
+	}
 	cfg.DBTargets = append(cfg.DBTargets, config.DBTarget{
 		ID:                    *id,
 		Driver:                *driver,
@@ -84,6 +99,7 @@ func runDBAdd(store config.Store, opts globalOptions, args []string, stdout io.W
 		Username:              *username,
 		DefaultTimeoutSeconds: defaultTimeoutSeconds(*timeoutSeconds),
 		MaxOutputBytes:        defaultMaxOutputBytes(*maxOutputBytes),
+		AdhocPolicy:           adhocPolicy,
 	})
 	secrets.DB[*id] = config.DBSecret{Password: password}
 	if err := store.SaveSecrets(masterKey, secrets); err != nil {
@@ -176,7 +192,7 @@ func runDBExec(store config.Store, opts globalOptions, args []string, stdout io.
 	if err != nil {
 		return writeError(stderr, err)
 	}
-	result, execErr := dbclient.Execute(context.Background(), target, secrets.DB[target.ID], rendered.Query, rendered.Args, tmpl.Kind, time.Duration(defaultTimeoutSeconds(tmpl.TimeoutSeconds))*time.Second, defaultMaxOutputBytes(tmpl.MaxOutputBytes))
+	result, execErr := dbExecute(context.Background(), target, secrets.DB[target.ID], rendered.Query, rendered.Args, tmpl.Kind, time.Duration(defaultTimeoutSeconds(tmpl.TimeoutSeconds))*time.Second, defaultMaxOutputBytes(tmpl.MaxOutputBytes))
 	response := map[string]any{
 		"ok":          execErr == nil,
 		"target":      target.ID,
@@ -195,6 +211,141 @@ func runDBExec(store config.Store, opts globalOptions, args []string, stdout io.
 		return 1
 	}
 	return 0
+}
+
+// runDBRisk 只解释 SQL 风险，不连接数据库。
+//
+// 该命令适合 agent 在执行前判断边界：低风险表示可尝试 db query；
+// 中风险返回模板审批建议；高风险/关键风险返回拒绝原因。
+func runDBRisk(store config.Store, opts globalOptions, args []string, stdout io.Writer, stderr io.Writer) int {
+	fs := flag.NewFlagSet("db risk", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	targetID := fs.String("target", "", "数据库目标 ID")
+	sqlText := fs.String("sql", "", "待评估的 SQL")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	start := time.Now()
+	cfg, err := store.LoadConfig()
+	if err != nil {
+		return writeError(stderr, err)
+	}
+	if _, ok := cfg.FindDBTarget(*targetID); !ok {
+		return writeError(stderr, fmt.Errorf("数据库目标 %q 不存在", *targetID))
+	}
+	assessment := risk.ClassifySQL(*sqlText)
+	response := map[string]any{"ok": true, "target": *targetID, "duration_ms": time.Since(start).Milliseconds()}
+	addRiskFields(response, assessment)
+	if assessment.Decision == risk.DecisionTemplateRequired {
+		response["suggested_approval_command"] = suggestedDBTemplateCommand(*targetID, *sqlText, policy.SQLKindWrite)
+	}
+	auditID := writeAudit(store, audit.Event{
+		Action:      "db.risk",
+		Target:      *targetID,
+		Params:      map[string]string{"sql_sha256": hashSummary(*sqlText)},
+		RiskLevel:   string(assessment.Level),
+		Decision:    string(assessment.Decision),
+		RiskReasons: assessment.Reasons,
+		OK:          true,
+		DurationMS:  time.Since(start).Milliseconds(),
+	})
+	response["audit_id"] = auditID
+	return writeValue(stdout, opts.Format, response)
+}
+
+// runDBQuery 执行低风险 SQL 临时查询。
+//
+// 它只会执行风险分级为 low/allow 的只读 SQL；写入类 SQL 返回模板审批建议，
+// 危险 SQL 直接拒绝。只有真正允许执行时才会读取 SAFE_INSPECTOR_MASTER_KEY。
+func runDBQuery(store config.Store, opts globalOptions, args []string, stdout io.Writer, stderr io.Writer) int {
+	fs := flag.NewFlagSet("db query", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	targetID := fs.String("target", "", "数据库目标 ID")
+	sqlText := fs.String("sql", "", "待执行的 SQL")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	start := time.Now()
+	cfg, err := store.LoadConfig()
+	if err != nil {
+		return writeError(stderr, err)
+	}
+	target, ok := cfg.FindDBTarget(*targetID)
+	if !ok {
+		return writeError(stderr, fmt.Errorf("数据库目标 %q 不存在", *targetID))
+	}
+	assessment := risk.ClassifySQL(*sqlText)
+	if assessment.Decision == risk.DecisionTemplateRequired {
+		return writeDBAdhocDecision(store, opts, stdout, start, target.ID, *sqlText, assessment, suggestedDBTemplateCommand(target.ID, *sqlText, policy.SQLKindWrite), 0)
+	}
+	if assessment.Decision == risk.DecisionDeny {
+		return writeDBAdhocDecision(store, opts, stdout, start, target.ID, *sqlText, assessment, "", 1)
+	}
+	adhocPolicy := target.NormalizedAdhocPolicy()
+	if !adhocPolicy.Enabled {
+		assessment = deniedByAdhocPolicy(assessment, "目标未开启 adhoc_policy，低风险临时查询被拒绝")
+		return writeDBAdhocDecision(store, opts, stdout, start, target.ID, *sqlText, assessment, "", 1)
+	}
+	if !risk.Allows(adhocPolicy.MaxRisk, assessment.Level) {
+		assessment = deniedByAdhocPolicy(assessment, fmt.Sprintf("目标 adhoc_policy 只允许最高风险等级 %s", adhocPolicy.MaxRisk))
+		return writeDBAdhocDecision(store, opts, stdout, start, target.ID, *sqlText, assessment, "", 1)
+	}
+
+	secrets, _, err := loadExecutionSecrets(store)
+	if err != nil {
+		return writeError(stderr, err)
+	}
+	result, execErr := dbExecute(context.Background(), target, secrets.DB[target.ID], *sqlText, nil, policy.SQLKindRead, time.Duration(defaultTimeoutSeconds(target.DefaultTimeoutSeconds))*time.Second, defaultMaxOutputBytes(target.MaxOutputBytes))
+	response := map[string]any{
+		"ok":          execErr == nil,
+		"target":      target.ID,
+		"duration_ms": time.Since(start).Milliseconds(),
+		"result":      result,
+		"truncated":   result.Truncated,
+	}
+	addRiskFields(response, assessment)
+	if execErr != nil {
+		response["error"] = execErr.Error()
+	}
+	auditID := writeAudit(store, audit.Event{
+		Action:      "db.query",
+		Target:      target.ID,
+		Params:      map[string]string{"sql_sha256": hashSummary(*sqlText)},
+		RiskLevel:   string(assessment.Level),
+		Decision:    string(assessment.Decision),
+		RiskReasons: assessment.Reasons,
+		OK:          execErr == nil,
+		DurationMS:  time.Since(start).Milliseconds(),
+		ErrorClass:  errorClass(execErr),
+	})
+	response["audit_id"] = auditID
+	writeValue(stdout, opts.Format, response)
+	if execErr != nil {
+		return 1
+	}
+	return 0
+}
+
+// writeDBAdhocDecision 输出未执行 SQL 时的结构化风险结果并写审计。
+func writeDBAdhocDecision(store config.Store, opts globalOptions, stdout io.Writer, start time.Time, targetID string, sqlText string, assessment risk.Assessment, suggestion string, exitCode int) int {
+	response := map[string]any{"ok": false, "target": targetID, "duration_ms": time.Since(start).Milliseconds()}
+	addRiskFields(response, assessment)
+	if suggestion != "" {
+		response["suggested_approval_command"] = suggestion
+	}
+	auditID := writeAudit(store, audit.Event{
+		Action:      "db.query",
+		Target:      targetID,
+		Params:      map[string]string{"sql_sha256": hashSummary(sqlText)},
+		RiskLevel:   string(assessment.Level),
+		Decision:    string(assessment.Decision),
+		RiskReasons: assessment.Reasons,
+		OK:          false,
+		DurationMS:  time.Since(start).Milliseconds(),
+	})
+	response["audit_id"] = auditID
+	writeValue(stdout, opts.Format, response)
+	return exitCode
 }
 
 func loadDBTemplateFromFlags(fromFile string, targetID string, name string, sqlText string, kind string, timeoutSeconds int, maxOutputBytes int64, description string, params []string) (config.DBTemplate, error) {

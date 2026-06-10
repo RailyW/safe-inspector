@@ -1,7 +1,7 @@
 // Package audit 负责把配置变更和执行动作写入本地 JSONL 审计日志。
 //
-// 审计日志只记录目标、模板、参数摘要、结果状态和错误类别，严禁写入任何
-// SSH/MySQL 密码、主秘钥、私钥 passphrase 或 sudo 密码。
+// 审计日志只记录目标、模板、参数摘要、风险等级、风险决策、结果状态和错误类别，
+// 严禁写入任何 SSH/MySQL 密码、主秘钥、私钥 passphrase 或 sudo 密码。
 package audit
 
 import (
@@ -15,15 +15,18 @@ import (
 
 // Event 是 audit.jsonl 中的一行审计记录。
 type Event struct {
-	ID         string            `json:"id"`
-	Time       time.Time         `json:"time"`
-	Action     string            `json:"action"`
-	Target     string            `json:"target,omitempty"`
-	Template   string            `json:"template,omitempty"`
-	Params     map[string]string `json:"params,omitempty"`
-	OK         bool              `json:"ok"`
-	DurationMS int64             `json:"duration_ms,omitempty"`
-	ErrorClass string            `json:"error_class,omitempty"`
+	ID          string            `json:"id"`
+	Time        time.Time         `json:"time"`
+	Action      string            `json:"action"`
+	Target      string            `json:"target,omitempty"`
+	Template    string            `json:"template,omitempty"`
+	Params      map[string]string `json:"params,omitempty"`
+	RiskLevel   string            `json:"risk_level,omitempty"`
+	Decision    string            `json:"decision,omitempty"`
+	RiskReasons []string          `json:"risk_reasons,omitempty"`
+	OK          bool              `json:"ok"`
+	DurationMS  int64             `json:"duration_ms,omitempty"`
+	ErrorClass  string            `json:"error_class,omitempty"`
 }
 
 // Writer 将审计事件追加到 JSONL 文件。
