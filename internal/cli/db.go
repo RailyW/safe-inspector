@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
+	"github.com/RailyW/safe-inspector/internal/approval"
 	"github.com/RailyW/safe-inspector/internal/audit"
 	"github.com/RailyW/safe-inspector/internal/config"
 	"github.com/RailyW/safe-inspector/internal/dbclient"
@@ -21,6 +23,11 @@ import (
 //
 // 生产环境默认调用 dbclient.Execute；测试会替换它，避免连接真实 MySQL。
 var dbExecute = dbclient.Execute
+
+// dbExecuteApproved 是 LLM/danger 已审批 SQL 的执行注入点。
+//
+// 它默认调用 dbclient.ExecuteApproved，不再套用 classic SQL 风险校验。
+var dbExecuteApproved = dbclient.ExecuteApproved
 
 func runDB(store config.Store, opts globalOptions, args []string, stdout io.Writer, stderr io.Writer) int {
 	if len(args) == 0 {
@@ -185,14 +192,49 @@ func runDBExec(store config.Store, opts globalOptions, args []string, stdout io.
 	if err != nil {
 		return writeError(stderr, err)
 	}
-	if err := policy.ValidateSQLExecution(rendered.Query, tmpl.Kind); err != nil {
-		return writeError(stderr, err)
+	assessment := risk.ClassifySQL(rendered.Query)
+	approvalCfg := cfg.NormalizedApproval()
+	approvalResult := approval.Result{}
+	var reviewErr error
+	execute := dbExecute
+	if approvalCfg.Mode == config.ApprovalModeClassic {
+		if err := policy.ValidateSQLExecution(rendered.Query, tmpl.Kind); err != nil {
+			return writeError(stderr, err)
+		}
+		approvalResult = classicApprovalResult(risk.Assessment{Level: risk.LevelLow, Decision: risk.DecisionAllow, Reasons: []string{"已批准 SQL 模板执行"}})
+	} else {
+		execute = dbExecuteApproved
+		approvalResult, reviewErr = reviewExecution(context.Background(), cfg, approval.Request{
+			Operation:    approval.OperationDBExec,
+			TargetID:     target.ID,
+			TemplateName: tmpl.Name,
+			SQL:          rendered.Query,
+			SQLKind:      tmpl.Kind,
+			Params:       callParams,
+			ClassicRisk:  assessment,
+		})
+		if approvalResult.Decision != risk.DecisionAllow {
+			response := map[string]any{
+				"ok":          false,
+				"target":      target.ID,
+				"template":    tmpl.Name,
+				"duration_ms": time.Since(start).Milliseconds(),
+			}
+			addApprovalFields(response, approvalResult)
+			if reviewErr != nil {
+				response["error"] = reviewErr.Error()
+			}
+			auditID := writeAudit(store, approvalAuditFields(audit.Event{Action: "db.exec", Target: target.ID, Template: tmpl.Name, Params: callParams, OK: false, DurationMS: time.Since(start).Milliseconds(), ErrorClass: errorClass(reviewErr)}, approvalResult))
+			response["audit_id"] = auditID
+			writeValue(stdout, opts.Format, response)
+			return 1
+		}
 	}
 	secrets, _, err := loadExecutionSecrets(store)
 	if err != nil {
 		return writeError(stderr, err)
 	}
-	result, execErr := dbExecute(context.Background(), target, secrets.DB[target.ID], rendered.Query, rendered.Args, tmpl.Kind, time.Duration(defaultTimeoutSeconds(tmpl.TimeoutSeconds))*time.Second, defaultMaxOutputBytes(tmpl.MaxOutputBytes))
+	result, execErr := execute(context.Background(), target, secrets.DB[target.ID], rendered.Query, rendered.Args, tmpl.Kind, time.Duration(defaultTimeoutSeconds(tmpl.TimeoutSeconds))*time.Second, defaultMaxOutputBytes(tmpl.MaxOutputBytes))
 	response := map[string]any{
 		"ok":          execErr == nil,
 		"target":      target.ID,
@@ -204,7 +246,8 @@ func runDBExec(store config.Store, opts globalOptions, args []string, stdout io.
 	if execErr != nil {
 		response["error"] = execErr.Error()
 	}
-	auditID := writeAudit(store, audit.Event{Action: "db.exec", Target: target.ID, Template: tmpl.Name, Params: callParams, OK: execErr == nil, DurationMS: time.Since(start).Milliseconds(), ErrorClass: errorClass(execErr)})
+	addApprovalFields(response, approvalResult)
+	auditID := writeAudit(store, approvalAuditFields(audit.Event{Action: "db.exec", Target: target.ID, Template: tmpl.Name, Params: callParams, OK: execErr == nil, DurationMS: time.Since(start).Milliseconds(), ErrorClass: errorClass(execErr)}, approvalResult))
 	response["audit_id"] = auditID
 	writeValue(stdout, opts.Format, response)
 	if execErr != nil {
@@ -235,20 +278,34 @@ func runDBRisk(store config.Store, opts globalOptions, args []string, stdout io.
 	}
 	assessment := risk.ClassifySQL(*sqlText)
 	response := map[string]any{"ok": true, "target": *targetID, "duration_ms": time.Since(start).Milliseconds()}
-	addRiskFields(response, assessment)
-	if assessment.Decision == risk.DecisionTemplateRequired {
-		response["suggested_approval_command"] = suggestedDBTemplateCommand(*targetID, *sqlText, policy.SQLKindWrite)
+	approvalResult := classicApprovalResult(assessment)
+	var reviewErr error
+	if cfg.NormalizedApproval().Mode == config.ApprovalModeClassic {
+		if assessment.Decision == risk.DecisionTemplateRequired {
+			approvalResult.SuggestedTemplate = suggestedDBTemplateCommand(*targetID, *sqlText, policy.SQLKindWrite)
+		}
+	} else {
+		approvalResult, reviewErr = reviewExecution(context.Background(), cfg, approval.Request{
+			Operation:   approval.OperationDBQuery,
+			TargetID:    *targetID,
+			SQL:         *sqlText,
+			SQLKind:     inferAdhocSQLKind(*sqlText),
+			ClassicRisk: assessment,
+		})
+		if reviewErr != nil {
+			response["ok"] = false
+			response["error"] = reviewErr.Error()
+		}
 	}
-	auditID := writeAudit(store, audit.Event{
-		Action:      "db.risk",
-		Target:      *targetID,
-		Params:      map[string]string{"sql_sha256": hashSummary(*sqlText)},
-		RiskLevel:   string(assessment.Level),
-		Decision:    string(assessment.Decision),
-		RiskReasons: assessment.Reasons,
-		OK:          true,
-		DurationMS:  time.Since(start).Milliseconds(),
-	})
+	addApprovalFields(response, approvalResult)
+	auditID := writeAudit(store, approvalAuditFields(audit.Event{
+		Action:     "db.risk",
+		Target:     *targetID,
+		Params:     map[string]string{"sql_sha256": hashSummary(*sqlText)},
+		OK:         reviewErr == nil,
+		DurationMS: time.Since(start).Milliseconds(),
+		ErrorClass: errorClass(reviewErr),
+	}, approvalResult))
 	response["audit_id"] = auditID
 	return writeValue(stdout, opts.Format, response)
 }
@@ -275,27 +332,48 @@ func runDBQuery(store config.Store, opts globalOptions, args []string, stdout io
 		return writeError(stderr, fmt.Errorf("数据库目标 %q 不存在", *targetID))
 	}
 	assessment := risk.ClassifySQL(*sqlText)
-	if assessment.Decision == risk.DecisionTemplateRequired {
-		return writeDBAdhocDecision(store, opts, stdout, start, target.ID, *sqlText, assessment, suggestedDBTemplateCommand(target.ID, *sqlText, policy.SQLKindWrite), 0)
-	}
-	if assessment.Decision == risk.DecisionDeny {
-		return writeDBAdhocDecision(store, opts, stdout, start, target.ID, *sqlText, assessment, "", 1)
-	}
-	adhocPolicy := target.NormalizedAdhocPolicy()
-	if !adhocPolicy.Enabled {
-		assessment = deniedByAdhocPolicy(assessment, "目标未开启 adhoc_policy，低风险临时查询被拒绝")
-		return writeDBAdhocDecision(store, opts, stdout, start, target.ID, *sqlText, assessment, "", 1)
-	}
-	if !risk.Allows(adhocPolicy.MaxRisk, assessment.Level) {
-		assessment = deniedByAdhocPolicy(assessment, fmt.Sprintf("目标 adhoc_policy 只允许最高风险等级 %s", adhocPolicy.MaxRisk))
-		return writeDBAdhocDecision(store, opts, stdout, start, target.ID, *sqlText, assessment, "", 1)
+	approvalCfg := cfg.NormalizedApproval()
+	approvalResult := classicApprovalResult(assessment)
+	execute := dbExecute
+	sqlKind := policy.SQLKindRead
+	var reviewErr error
+	if approvalCfg.Mode == config.ApprovalModeClassic {
+		if assessment.Decision == risk.DecisionTemplateRequired {
+			approvalResult.SuggestedTemplate = suggestedDBTemplateCommand(target.ID, *sqlText, policy.SQLKindWrite)
+			return writeDBAdhocDecision(store, opts, stdout, start, target.ID, *sqlText, approvalResult, 0, nil)
+		}
+		if assessment.Decision == risk.DecisionDeny {
+			return writeDBAdhocDecision(store, opts, stdout, start, target.ID, *sqlText, approvalResult, 1, nil)
+		}
+		adhocPolicy := target.NormalizedAdhocPolicy()
+		if !adhocPolicy.Enabled {
+			assessment = deniedByAdhocPolicy(assessment, "目标未开启 adhoc_policy，低风险临时查询被拒绝")
+			return writeDBAdhocDecision(store, opts, stdout, start, target.ID, *sqlText, classicApprovalResult(assessment), 1, nil)
+		}
+		if !risk.Allows(adhocPolicy.MaxRisk, assessment.Level) {
+			assessment = deniedByAdhocPolicy(assessment, fmt.Sprintf("目标 adhoc_policy 只允许最高风险等级 %s", adhocPolicy.MaxRisk))
+			return writeDBAdhocDecision(store, opts, stdout, start, target.ID, *sqlText, classicApprovalResult(assessment), 1, nil)
+		}
+	} else {
+		execute = dbExecuteApproved
+		sqlKind = inferAdhocSQLKind(*sqlText)
+		approvalResult, reviewErr = reviewExecution(context.Background(), cfg, approval.Request{
+			Operation:   approval.OperationDBQuery,
+			TargetID:    target.ID,
+			SQL:         *sqlText,
+			SQLKind:     sqlKind,
+			ClassicRisk: assessment,
+		})
+		if approvalResult.Decision != risk.DecisionAllow {
+			return writeDBAdhocDecision(store, opts, stdout, start, target.ID, *sqlText, approvalResult, 1, reviewErr)
+		}
 	}
 
 	secrets, _, err := loadExecutionSecrets(store)
 	if err != nil {
 		return writeError(stderr, err)
 	}
-	result, execErr := dbExecute(context.Background(), target, secrets.DB[target.ID], *sqlText, nil, policy.SQLKindRead, time.Duration(defaultTimeoutSeconds(target.DefaultTimeoutSeconds))*time.Second, defaultMaxOutputBytes(target.MaxOutputBytes))
+	result, execErr := execute(context.Background(), target, secrets.DB[target.ID], *sqlText, nil, sqlKind, time.Duration(defaultTimeoutSeconds(target.DefaultTimeoutSeconds))*time.Second, defaultMaxOutputBytes(target.MaxOutputBytes))
 	response := map[string]any{
 		"ok":          execErr == nil,
 		"target":      target.ID,
@@ -303,21 +381,18 @@ func runDBQuery(store config.Store, opts globalOptions, args []string, stdout io
 		"result":      result,
 		"truncated":   result.Truncated,
 	}
-	addRiskFields(response, assessment)
+	addApprovalFields(response, approvalResult)
 	if execErr != nil {
 		response["error"] = execErr.Error()
 	}
-	auditID := writeAudit(store, audit.Event{
-		Action:      "db.query",
-		Target:      target.ID,
-		Params:      map[string]string{"sql_sha256": hashSummary(*sqlText)},
-		RiskLevel:   string(assessment.Level),
-		Decision:    string(assessment.Decision),
-		RiskReasons: assessment.Reasons,
-		OK:          execErr == nil,
-		DurationMS:  time.Since(start).Milliseconds(),
-		ErrorClass:  errorClass(execErr),
-	})
+	auditID := writeAudit(store, approvalAuditFields(audit.Event{
+		Action:     "db.query",
+		Target:     target.ID,
+		Params:     map[string]string{"sql_sha256": hashSummary(*sqlText)},
+		OK:         execErr == nil,
+		DurationMS: time.Since(start).Milliseconds(),
+		ErrorClass: errorClass(execErr),
+	}, approvalResult))
 	response["audit_id"] = auditID
 	writeValue(stdout, opts.Format, response)
 	if execErr != nil {
@@ -327,22 +402,20 @@ func runDBQuery(store config.Store, opts globalOptions, args []string, stdout io
 }
 
 // writeDBAdhocDecision 输出未执行 SQL 时的结构化风险结果并写审计。
-func writeDBAdhocDecision(store config.Store, opts globalOptions, stdout io.Writer, start time.Time, targetID string, sqlText string, assessment risk.Assessment, suggestion string, exitCode int) int {
+func writeDBAdhocDecision(store config.Store, opts globalOptions, stdout io.Writer, start time.Time, targetID string, sqlText string, approvalResult approval.Result, exitCode int, reviewErr error) int {
 	response := map[string]any{"ok": false, "target": targetID, "duration_ms": time.Since(start).Milliseconds()}
-	addRiskFields(response, assessment)
-	if suggestion != "" {
-		response["suggested_approval_command"] = suggestion
+	addApprovalFields(response, approvalResult)
+	if reviewErr != nil {
+		response["error"] = reviewErr.Error()
 	}
-	auditID := writeAudit(store, audit.Event{
-		Action:      "db.query",
-		Target:      targetID,
-		Params:      map[string]string{"sql_sha256": hashSummary(sqlText)},
-		RiskLevel:   string(assessment.Level),
-		Decision:    string(assessment.Decision),
-		RiskReasons: assessment.Reasons,
-		OK:          false,
-		DurationMS:  time.Since(start).Milliseconds(),
-	})
+	auditID := writeAudit(store, approvalAuditFields(audit.Event{
+		Action:     "db.query",
+		Target:     targetID,
+		Params:     map[string]string{"sql_sha256": hashSummary(sqlText)},
+		OK:         false,
+		DurationMS: time.Since(start).Milliseconds(),
+		ErrorClass: errorClass(reviewErr),
+	}, approvalResult))
 	response["audit_id"] = auditID
 	writeValue(stdout, opts.Format, response)
 	return exitCode
@@ -392,4 +465,21 @@ func normalizeDBTemplate(tmpl config.DBTemplate) (config.DBTemplate, error) {
 	tmpl.TimeoutSeconds = defaultTimeoutSeconds(tmpl.TimeoutSeconds)
 	tmpl.MaxOutputBytes = defaultMaxOutputBytes(tmpl.MaxOutputBytes)
 	return tmpl, nil
+}
+
+// inferAdhocSQLKind 在 LLM/danger 模式下为临时 SQL 选择 Query 或 Exec。
+//
+// classic 模式不会使用该函数；它仍然由 deterministic policy 保证只读查询。
+// 非只读首词统一归为 write，让 MySQL driver 通过 ExecContext 处理。
+func inferAdhocSQLKind(sqlText string) string {
+	fields := strings.Fields(strings.TrimSpace(sqlText))
+	if len(fields) == 0 {
+		return policy.SQLKindRead
+	}
+	switch strings.ToUpper(fields[0]) {
+	case "SELECT", "SHOW", "DESCRIBE", "DESC", "EXPLAIN":
+		return policy.SQLKindRead
+	default:
+		return policy.SQLKindWrite
+	}
 }

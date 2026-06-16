@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -171,6 +173,107 @@ func TestRunDBQueryExecutesLowRiskSQLWhenAdhocEnabled(t *testing.T) {
 	if !strings.Contains(stdout.String(), `"columns":["1"]`) {
 		t.Fatalf("db query did not include fake result: %s", stdout.String())
 	}
+}
+
+func TestRunSSHRunUsesLLMApprovalForClassicMediumCommand(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	reviewer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Fatalf("unexpected reviewer path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"chatcmpl-cli-allow",
+			"choices":[{"message":{"content":"{\"decision\":\"allow\",\"risk_level\":\"medium\",\"reason\":\"允许一次性诊断读取\",\"policy_violations\":[],\"confidence\":\"high\"}"}}]
+		}`))
+	}))
+	defer reviewer.Close()
+
+	store := initTestStoreWithConfig(t, func(cfg *config.Config) {
+		cfg.Approval = config.ApprovalConfig{
+			Mode: config.ApprovalModeLLM,
+			LLM: config.LLMApprovalConfig{
+				Provider:       config.LLMProviderOpenAIChatCompletions,
+				BaseURL:        reviewer.URL,
+				Model:          "gpt-test",
+				APIKeyEnv:      "OPENAI_API_KEY",
+				TimeoutSeconds: 2,
+				FailClosed:     true,
+			},
+		}
+		cfg.SSHTargets = append(cfg.SSHTargets, config.SSHTarget{ID: "prod-ssh", Host: "127.0.0.1", Port: 22, User: "root", AuthType: "password"})
+	})
+	if err := store.SaveSecrets("master-key", config.Secrets{SSH: map[string]config.SSHSecret{"prod-ssh": {Password: "secret"}}, DB: map[string]config.DBSecret{}}); err != nil {
+		t.Fatalf("SaveSecrets returned error: %v", err)
+	}
+	t.Setenv(secure.EnvMasterKey, "master-key")
+	oldSSHExecute := sshExecute
+	t.Cleanup(func() { sshExecute = oldSSHExecute })
+	sshExecute = func(ctx context.Context, target config.SSHTarget, secret config.SSHSecret, command string, useSudo bool, timeout time.Duration, maxOutputBytes int64) (sshclient.Result, error) {
+		if command != "cat /var/log/app.log" {
+			t.Fatalf("unexpected SSH command: %q", command)
+		}
+		return sshclient.Result{Stdout: "log line\n", ExitCode: 0}, nil
+	}
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	exitCode := Run([]string{"--config-dir", store.Paths.Dir, "ssh", "run", "--target", "prod-ssh", "--command", "cat /var/log/app.log"}, strings.NewReader(""), &stdout, &stderr)
+	if exitCode != 0 {
+		t.Fatalf("ssh run in llm mode should execute, got %d stderr=%s stdout=%s", exitCode, stderr.String(), stdout.String())
+	}
+	assertJSONField(t, stdout.String(), "approval_mode", config.ApprovalModeLLM)
+	assertJSONField(t, stdout.String(), "decision", "allow")
+	assertJSONField(t, stdout.String(), "llm_request_id", "chatcmpl-cli-allow")
+	if !strings.Contains(stdout.String(), "log line") {
+		t.Fatalf("ssh run did not include fake stdout: %s", stdout.String())
+	}
+}
+
+func TestRunDBQueryDangerModeBypassesClassicSQLRisk(t *testing.T) {
+	store := initTestStoreWithConfig(t, func(cfg *config.Config) {
+		cfg.Approval = config.ApprovalConfig{Mode: config.ApprovalModeDangerAllowAll}
+		cfg.DBTargets = append(cfg.DBTargets, config.DBTarget{ID: "prod-db", Driver: "mysql", Host: "127.0.0.1", Port: 3306, Database: "app", Username: "writer"})
+	})
+	if err := store.SaveSecrets("master-key", config.Secrets{SSH: map[string]config.SSHSecret{}, DB: map[string]config.DBSecret{"prod-db": {Password: "secret"}}}); err != nil {
+		t.Fatalf("SaveSecrets returned error: %v", err)
+	}
+	t.Setenv(secure.EnvMasterKey, "master-key")
+	oldDBExecuteApproved := dbExecuteApproved
+	t.Cleanup(func() { dbExecuteApproved = oldDBExecuteApproved })
+	dbExecuteApproved = func(ctx context.Context, target config.DBTarget, secret config.DBSecret, query string, args []any, kind string, timeout time.Duration, maxOutputBytes int64) (dbclient.Result, error) {
+		if query != "update users set disabled = 1 where id = 42" || kind != "write" {
+			t.Fatalf("unexpected DB execution query=%q kind=%q", query, kind)
+		}
+		return dbclient.Result{RowsAffected: 1}, nil
+	}
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	exitCode := Run([]string{"--config-dir", store.Paths.Dir, "db", "query", "--target", "prod-db", "--sql", "update users set disabled = 1 where id = 42"}, strings.NewReader(""), &stdout, &stderr)
+	if exitCode != 0 {
+		t.Fatalf("db query in danger mode should execute write SQL, got %d stderr=%s stdout=%s", exitCode, stderr.String(), stdout.String())
+	}
+	assertJSONField(t, stdout.String(), "approval_mode", config.ApprovalModeDangerAllowAll)
+	assertJSONField(t, stdout.String(), "approval_bypassed", true)
+	assertJSONField(t, stdout.String(), "decision", "allow")
+	if !strings.Contains(stdout.String(), `"rows_affected":1`) {
+		t.Fatalf("db query did not include fake affected rows: %s", stdout.String())
+	}
+}
+
+func TestRunApprovalStatusReportsMode(t *testing.T) {
+	store := initTestStoreWithConfig(t, func(cfg *config.Config) {
+		cfg.Approval = config.ApprovalConfig{Mode: config.ApprovalModeLLM}
+	})
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	exitCode := Run([]string{"--config-dir", store.Paths.Dir, "approval", "status"}, strings.NewReader(""), &stdout, &stderr)
+	if exitCode != 0 {
+		t.Fatalf("approval status should succeed, got %d stderr=%s", exitCode, stderr.String())
+	}
+	assertJSONField(t, stdout.String(), "mode", config.ApprovalModeLLM)
 }
 
 func initTestStoreWithConfig(t *testing.T, mutate func(*config.Config)) config.Store {

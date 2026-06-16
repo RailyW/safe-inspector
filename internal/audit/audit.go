@@ -15,18 +15,23 @@ import (
 
 // Event 是 audit.jsonl 中的一行审计记录。
 type Event struct {
-	ID          string            `json:"id"`
-	Time        time.Time         `json:"time"`
-	Action      string            `json:"action"`
-	Target      string            `json:"target,omitempty"`
-	Template    string            `json:"template,omitempty"`
-	Params      map[string]string `json:"params,omitempty"`
-	RiskLevel   string            `json:"risk_level,omitempty"`
-	Decision    string            `json:"decision,omitempty"`
-	RiskReasons []string          `json:"risk_reasons,omitempty"`
-	OK          bool              `json:"ok"`
-	DurationMS  int64             `json:"duration_ms,omitempty"`
-	ErrorClass  string            `json:"error_class,omitempty"`
+	ID               string            `json:"id"`
+	Time             time.Time         `json:"time"`
+	Action           string            `json:"action"`
+	Target           string            `json:"target,omitempty"`
+	Template         string            `json:"template,omitempty"`
+	Params           map[string]string `json:"params,omitempty"`
+	RiskLevel        string            `json:"risk_level,omitempty"`
+	Decision         string            `json:"decision,omitempty"`
+	RiskReasons      []string          `json:"risk_reasons,omitempty"`
+	ApprovalMode     string            `json:"approval_mode,omitempty"`
+	Reviewer         string            `json:"reviewer,omitempty"`
+	LLMModel         string            `json:"llm_model,omitempty"`
+	LLMRequestID     string            `json:"llm_request_id,omitempty"`
+	ApprovalBypassed bool              `json:"approval_bypassed,omitempty"`
+	OK               bool              `json:"ok"`
+	DurationMS       int64             `json:"duration_ms,omitempty"`
+	ErrorClass       string            `json:"error_class,omitempty"`
 }
 
 // Writer 将审计事件追加到 JSONL 文件。

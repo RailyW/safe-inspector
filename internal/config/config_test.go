@@ -74,3 +74,40 @@ func TestAdhocPolicyDefaultsToDisabledForOldTargets(t *testing.T) {
 		t.Fatalf("normalized zero-value DB adhoc policy must stay disabled")
 	}
 }
+
+func TestApprovalDefaultsToClassicForOldConfigs(t *testing.T) {
+	cfg := Config{}
+	approval := cfg.NormalizedApproval()
+	if approval.Mode != ApprovalModeClassic {
+		t.Fatalf("zero-value approval mode = %q, want %q", approval.Mode, ApprovalModeClassic)
+	}
+	if approval.LLM.Provider != LLMProviderOpenAIChatCompletions {
+		t.Fatalf("default llm provider = %q, want %q", approval.LLM.Provider, LLMProviderOpenAIChatCompletions)
+	}
+	if approval.LLM.Model != DefaultLLMModel {
+		t.Fatalf("default llm model = %q, want %q", approval.LLM.Model, DefaultLLMModel)
+	}
+	if approval.LLM.APIKeyEnv != DefaultLLMAPIKeyEnv {
+		t.Fatalf("default llm api key env = %q, want %q", approval.LLM.APIKeyEnv, DefaultLLMAPIKeyEnv)
+	}
+	if !approval.LLM.FailClosed {
+		t.Fatalf("llm approval must default to fail-closed")
+	}
+}
+
+func TestStoreInitPersistsClassicApprovalMode(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewStore returned error: %v", err)
+	}
+	if err := store.Init("master-key"); err != nil {
+		t.Fatalf("Init returned error: %v", err)
+	}
+	cfg, err := store.LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig returned error: %v", err)
+	}
+	if got := cfg.NormalizedApproval().Mode; got != ApprovalModeClassic {
+		t.Fatalf("initialized approval mode = %q, want %q", got, ApprovalModeClassic)
+	}
+}

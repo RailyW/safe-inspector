@@ -52,6 +52,8 @@ func Run(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) int
 		return runInit(store, opts, stdout, stderr)
 	case "status":
 		return runStatus(store, opts, stdout, stderr)
+	case "approval":
+		return runApproval(store, opts, rest[1:], stdout, stderr)
 	case "ssh":
 		return runSSH(store, opts, rest[1:], stdout, stderr)
 	case "db":
@@ -118,6 +120,10 @@ func runInit(store config.Store, opts globalOptions, stdout io.Writer, stderr io
 }
 
 func runStatus(store config.Store, opts globalOptions, stdout io.Writer, stderr io.Writer) int {
+	approvalMode := ""
+	if cfg, err := store.LoadConfig(); err == nil {
+		approvalMode = cfg.NormalizedApproval().Mode
+	}
 	status := map[string]any{
 		"ok":             true,
 		"config_dir":     store.Paths.Dir,
@@ -125,6 +131,7 @@ func runStatus(store config.Store, opts globalOptions, stdout io.Writer, stderr 
 		"secrets_file":   fileExists(store.Paths.SecretsFile),
 		"audit_file":     fileExists(store.Paths.AuditFile),
 		"env_master_key": os.Getenv(secure.EnvMasterKey) != "",
+		"approval_mode":  approvalMode,
 	}
 	return writeValue(stdout, opts.Format, status)
 }
@@ -196,6 +203,9 @@ func HelpText() string {
 全局命令:
   init                         初始化用户级配置和加密 secret 文件
   status                       检查配置文件、secret 文件和环境变量状态
+  approval status              查看当前审批模式和 LLM reviewer 配置
+  approval mode set            切换 classic、llm、danger_allow_all 审批模式
+  approval llm test            测试 LLM reviewer structured output 审批
   ssh add                      添加 SSH 目标
   ssh template add             为 SSH 目标添加安全命令模板
   ssh exec                     执行已批准的 SSH 命令模板
@@ -211,29 +221,52 @@ func HelpText() string {
   - 默认输出 JSON，可用 --format text 切换人工可读输出。
   - 执行命令只读取 SAFE_INSPECTOR_MASTER_KEY 做内部解密，不输出认证信息。
   - 新增目标和模板必须在交互式终端输入主秘钥。
-  - 临时执行必须由目标显式开启 --allow-adhoc-low-risk，且只允许低风险动作。
-  - 中风险临时动作只返回 suggested_approval_command，不会连接生产资源。
-  - MySQL 默认只读，写入必须使用 kind=write 模板，DDL/DCL 和多语句始终拒绝。
+  - 默认 classic 模式：临时执行必须由目标显式开启 --allow-adhoc-low-risk，且只允许低风险动作。
+  - llm 模式：每次 SSH/SQL 执行都由 Chat Completions reviewer 返回固定 JSON 审批，失败默认拒绝。
+  - danger_allow_all 模式：危险完全放行，输出和审计会标记 approval_bypassed=true。
+  - classic 模式下 MySQL 默认只读，写入必须使用 kind=write 模板，DDL/DCL 和多语句始终拒绝。
 `
 }
 
 func SkillsText() string {
 	return `# safe-inspector CLI skills
 
-你是大语言模型时，应把 safe-inspector 当成只读优先、低风险可临时执行、越界转模板审批的生产环境访问工具。
+你是大语言模型时，应把 safe-inspector 当成带审批模式的生产环境访问工具。当前支持三种模式：` + "`classic`" + `、` + "`llm`" + `、` + "`danger_allow_all`" + `。
 
 ## 基本原则
 
 - 不要输出密码、SSH 私钥 passphrase、sudo 密码、MySQL 密码或主秘钥。
-- 不要尝试绕过风险分级或安全模板。
-- 对新需求，优先使用 ` + "`ssh run`" + ` 或 ` + "`db query`" + `；如果返回 ` + "`decision=template_required`" + `，把 ` + "`suggested_approval_command`" + ` 展示给用户，让用户自己在终端审批。
+- 先用 ` + "`approval status`" + ` 或 ` + "`status`" + ` 确认当前 ` + "`approval_mode`" + `。
+- ` + "`classic`" + ` 模式下，不要尝试绕过风险分级或安全模板；优先使用 ` + "`ssh run`" + ` 或 ` + "`db query`" + `，如果返回 ` + "`decision=template_required`" + `，把 ` + "`suggested_approval_command`" + ` 展示给用户，让用户自己在终端审批。
+- ` + "`llm`" + ` 模式下，` + "`ssh run`" + `、` + "`ssh exec`" + `、` + "`db query`" + `、` + "`db exec`" + ` 会先请求 LLM reviewer；只有 ` + "`decision=allow`" + ` 才表示已执行。
+- ` + "`danger_allow_all`" + ` 模式下，工具会危险地跳过审批；看到 ` + "`approval_bypassed=true`" + ` 时必须在回复里明确提醒用户这是完全放行模式。
 - 如果返回 ` + "`decision=deny`" + `，停止执行并向用户解释 ` + "`risk_reasons`" + `。
-- 执行命令默认返回 JSON，优先解析 ` + "`ok`" + `、` + "`decision`" + `、` + "`risk_level`" + `、` + "`risk_reasons`" + `、` + "`error`" + `、` + "`stdout`" + `、` + "`result`" + `、` + "`audit_id`" + ` 字段。
+- 执行命令默认返回 JSON，优先解析 ` + "`ok`" + `、` + "`approval_mode`" + `、` + "`reviewer`" + `、` + "`decision`" + `、` + "`risk_level`" + `、` + "`risk_reasons`" + `、` + "`error`" + `、` + "`stdout`" + `、` + "`result`" + `、` + "`llm_request_id`" + `、` + "`approval_bypassed`" + `、` + "`audit_id`" + ` 字段。
 
 ## 查看状态
 
 ` + "```powershell" + `
 safe-inspector status
+` + "```" + `
+
+查看审批模式：
+
+` + "```powershell" + `
+safe-inspector approval status
+` + "```" + `
+
+LLM reviewer 连通性测试：
+
+` + "```powershell" + `
+safe-inspector approval llm test
+` + "```" + `
+
+你不要自行切换审批模式，除非用户明确要求。审批模式变更命令必须由用户在交互式终端输入主秘钥，例如：
+
+` + "```powershell" + `
+safe-inspector approval mode set --mode llm --model gpt-5.5 --api-key-env OPENAI_API_KEY
+safe-inspector approval mode set --mode classic
+safe-inspector approval mode set --mode danger_allow_all --i-understand-production-risk
 ` + "```" + `
 
 ## 优先尝试低风险 SSH 临时执行
@@ -247,6 +280,8 @@ safe-inspector ssh run --target prod-web --command "systemctl status nginx --no-
 - ` + "`decision=allow`" + `：命令已执行，读取 ` + "`stdout`" + ` / ` + "`stderr`" + `。
 - ` + "`decision=template_required`" + `：不要执行，向用户展示 ` + "`suggested_approval_command`" + `。
 - ` + "`decision=deny`" + `：不要执行，解释 ` + "`risk_reasons`" + `。
+
+在 ` + "`classic`" + ` 模式下，低风险临时执行还要求目标开启 ` + "`adhoc_policy`" + `。在 ` + "`llm`" + ` 模式下，是否执行由 reviewer 返回的 ` + "`decision`" + ` 决定。在 ` + "`danger_allow_all`" + ` 模式下，看到 ` + "`approval_bypassed=true`" + ` 必须提醒用户。
 
 只评估不执行：
 
@@ -267,6 +302,8 @@ safe-inspector db query --target prod-mysql --sql "select count(*) as total from
 ` + "```" + `
 
 写入 SQL 会返回 ` + "`template_required`" + ` 和审批建议；DROP/ALTER/TRUNCATE/CREATE/GRANT/REVOKE、多语句、文件函数会返回 ` + "`deny`" + `。
+
+上述描述适用于 ` + "`classic`" + ` 模式。` + "`llm`" + ` 模式下，SQL 会先交给 reviewer 审批；` + "`danger_allow_all`" + ` 模式会跳过 classic SQL 策略。
 
 只评估不执行：
 

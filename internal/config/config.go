@@ -28,6 +28,17 @@ const (
 	AdhocRiskLow                 = "low"
 	SSHAdhocProfileObservability = "observability-v1"
 	DBAdhocProfileReadOnly       = "readonly-v1"
+
+	ApprovalModeClassic        = "classic"
+	ApprovalModeLLM            = "llm"
+	ApprovalModeDangerAllowAll = "danger_allow_all"
+
+	LLMProviderOpenAIChatCompletions = "openai_chat_completions"
+	DefaultLLMBaseURL                = "https://api.openai.com/v1"
+	DefaultLLMModel                  = "gpt-5.5"
+	DefaultLLMAPIKeyEnv              = "OPENAI_API_KEY"
+	DefaultLLMTimeoutSeconds         = 20
+	DefaultLLMMaxRetries             = 1
 )
 
 // Paths 描述 safe-inspector 在本机使用的所有配置文件路径。
@@ -52,6 +63,30 @@ type Config struct {
 	DBTargets    []DBTarget               `json:"db_targets" yaml:"db_targets"`
 	SSHTemplates []SSHTemplate            `json:"ssh_templates" yaml:"ssh_templates"`
 	DBTemplates  []DBTemplate             `json:"db_templates" yaml:"db_templates"`
+	Approval     ApprovalConfig           `json:"approval" yaml:"approval"`
+}
+
+// ApprovalConfig 描述 CLI 对一次执行请求使用的审批模式。
+//
+// classic 保持确定性模板/低风险策略；llm 会把每次执行请求发送到 LLM 审核；
+// danger_allow_all 会绕过所有审批校验，必须只由用户显式开启。
+type ApprovalConfig struct {
+	Mode string            `json:"mode" yaml:"mode"`
+	LLM  LLMApprovalConfig `json:"llm" yaml:"llm"`
+}
+
+// LLMApprovalConfig 保存 LLM 审批器的非敏感连接参数。
+//
+// API key 本身不保存在配置文件里，只通过 APIKeyEnv 指向运行时环境变量。
+// FailClosed 第一版固定归一化为 true，避免 reviewer 失败时默认放行。
+type LLMApprovalConfig struct {
+	Provider       string `json:"provider" yaml:"provider"`
+	BaseURL        string `json:"base_url" yaml:"base_url"`
+	Model          string `json:"model" yaml:"model"`
+	APIKeyEnv      string `json:"api_key_env" yaml:"api_key_env"`
+	TimeoutSeconds int    `json:"timeout_seconds" yaml:"timeout_seconds"`
+	MaxRetries     int    `json:"max_retries" yaml:"max_retries"`
+	FailClosed     bool   `json:"fail_closed" yaml:"fail_closed"`
 }
 
 // SSHTarget 是一台被允许连接的 SSH 机器的非敏感配置。
@@ -186,6 +221,7 @@ func (s Store) Init(masterKey string) error {
 		DBTargets:    []DBTarget{},
 		SSHTemplates: []SSHTemplate{},
 		DBTemplates:  []DBTemplate{},
+		Approval:     DefaultApprovalConfig(),
 	}
 	if err := s.SaveConfig(cfg); err != nil {
 		return err
@@ -304,6 +340,59 @@ func (c Config) FindDBTemplate(targetID string, name string) (DBTemplate, bool) 
 		}
 	}
 	return DBTemplate{}, false
+}
+
+// NormalizedApproval 返回补齐默认值后的审批配置。
+//
+// 旧 config.yaml 没有 approval 字段时，零值会归一化为 classic 模式；
+// 这样升级不会自动启用 LLM 审批或危险放行。
+func (c Config) NormalizedApproval() ApprovalConfig {
+	approval := c.Approval
+	switch approval.Mode {
+	case ApprovalModeLLM, ApprovalModeDangerAllowAll:
+	default:
+		approval.Mode = ApprovalModeClassic
+	}
+	approval.LLM = normalizeLLMApprovalConfig(approval.LLM)
+	return approval
+}
+
+// DefaultApprovalConfig 返回新初始化配置使用的审批默认值。
+func DefaultApprovalConfig() ApprovalConfig {
+	return ApprovalConfig{
+		Mode: ApprovalModeClassic,
+		LLM:  normalizeLLMApprovalConfig(LLMApprovalConfig{}),
+	}
+}
+
+// normalizeLLMApprovalConfig 补齐 OpenAI Chat Completions reviewer 默认值。
+//
+// FailClosed 始终设为 true，配置文件即使缺省或写 false，也不会让 reviewer
+// 失败时默认通过审批。
+func normalizeLLMApprovalConfig(llm LLMApprovalConfig) LLMApprovalConfig {
+	if llm.Provider == "" {
+		llm.Provider = LLMProviderOpenAIChatCompletions
+	}
+	if llm.BaseURL == "" {
+		llm.BaseURL = DefaultLLMBaseURL
+	}
+	if llm.Model == "" {
+		llm.Model = DefaultLLMModel
+	}
+	if llm.APIKeyEnv == "" {
+		llm.APIKeyEnv = DefaultLLMAPIKeyEnv
+	}
+	if llm.TimeoutSeconds <= 0 {
+		llm.TimeoutSeconds = DefaultLLMTimeoutSeconds
+	}
+	if llm.MaxRetries < 0 {
+		llm.MaxRetries = 0
+	}
+	if llm.MaxRetries == 0 {
+		llm.MaxRetries = DefaultLLMMaxRetries
+	}
+	llm.FailClosed = true
+	return llm
 }
 
 // NormalizedAdhocPolicy 返回 SSH 目标的临时执行策略。

@@ -9,6 +9,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/RailyW/safe-inspector/internal/approval"
 	"github.com/RailyW/safe-inspector/internal/audit"
 	"github.com/RailyW/safe-inspector/internal/config"
 	"github.com/RailyW/safe-inspector/internal/policy"
@@ -209,12 +210,37 @@ func runSSHExec(store config.Store, opts globalOptions, args []string, stdout io
 	if err != nil {
 		return writeError(stderr, err)
 	}
+	approvalResult, reviewErr := reviewExecution(context.Background(), cfg, approval.Request{
+		Operation:    approval.OperationSSHExec,
+		TargetID:     target.ID,
+		TemplateName: tmpl.Name,
+		Command:      command,
+		Sudo:         tmpl.Sudo,
+		Params:       callParams,
+		ClassicRisk:  risk.Assessment{Level: risk.LevelLow, Decision: risk.DecisionAllow, Reasons: []string{"已批准 SSH 模板执行"}},
+	})
+	if approvalResult.Decision != risk.DecisionAllow {
+		response := map[string]any{
+			"ok":          false,
+			"target":      target.ID,
+			"template":    tmpl.Name,
+			"duration_ms": time.Since(start).Milliseconds(),
+		}
+		addApprovalFields(response, approvalResult)
+		if reviewErr != nil {
+			response["error"] = reviewErr.Error()
+		}
+		auditID := writeAudit(store, approvalAuditFields(audit.Event{Action: "ssh.exec", Target: target.ID, Template: tmpl.Name, Params: callParams, OK: false, DurationMS: time.Since(start).Milliseconds(), ErrorClass: errorClass(reviewErr)}, approvalResult))
+		response["audit_id"] = auditID
+		writeValue(stdout, opts.Format, response)
+		return 1
+	}
 	secrets, _, err := loadExecutionSecrets(store)
 	if err != nil {
 		return writeError(stderr, err)
 	}
 	secret := secrets.SSH[target.ID]
-	result, execErr := sshclient.Execute(context.Background(), target, secret, command, tmpl.Sudo, time.Duration(defaultTimeoutSeconds(tmpl.TimeoutSeconds))*time.Second, defaultMaxOutputBytes(tmpl.MaxOutputBytes))
+	result, execErr := sshExecute(context.Background(), target, secret, command, tmpl.Sudo, time.Duration(defaultTimeoutSeconds(tmpl.TimeoutSeconds))*time.Second, defaultMaxOutputBytes(tmpl.MaxOutputBytes))
 	response := map[string]any{
 		"ok":          execErr == nil,
 		"target":      target.ID,
@@ -228,7 +254,8 @@ func runSSHExec(store config.Store, opts globalOptions, args []string, stdout io
 	if execErr != nil {
 		response["error"] = execErr.Error()
 	}
-	auditID := writeAudit(store, audit.Event{Action: "ssh.exec", Target: target.ID, Template: tmpl.Name, Params: callParams, OK: execErr == nil, DurationMS: time.Since(start).Milliseconds(), ErrorClass: errorClass(execErr)})
+	addApprovalFields(response, approvalResult)
+	auditID := writeAudit(store, approvalAuditFields(audit.Event{Action: "ssh.exec", Target: target.ID, Template: tmpl.Name, Params: callParams, OK: execErr == nil, DurationMS: time.Since(start).Milliseconds(), ErrorClass: errorClass(execErr)}, approvalResult))
 	response["audit_id"] = auditID
 	writeValue(stdout, opts.Format, response)
 	if execErr != nil {
@@ -259,20 +286,33 @@ func runSSHRisk(store config.Store, opts globalOptions, args []string, stdout io
 	}
 	assessment := risk.ClassifySSHCommand(*command)
 	response := map[string]any{"ok": true, "target": *targetID, "duration_ms": time.Since(start).Milliseconds()}
-	addRiskFields(response, assessment)
-	if assessment.Decision == risk.DecisionTemplateRequired {
-		response["suggested_approval_command"] = suggestedSSHTemplateCommand(*targetID, *command)
+	approvalResult := classicApprovalResult(assessment)
+	var reviewErr error
+	if cfg.NormalizedApproval().Mode == config.ApprovalModeClassic {
+		if assessment.Decision == risk.DecisionTemplateRequired {
+			approvalResult.SuggestedTemplate = suggestedSSHTemplateCommand(*targetID, *command)
+		}
+	} else {
+		approvalResult, reviewErr = reviewExecution(context.Background(), cfg, approval.Request{
+			Operation:   approval.OperationSSHRun,
+			TargetID:    *targetID,
+			Command:     *command,
+			ClassicRisk: assessment,
+		})
+		if reviewErr != nil {
+			response["ok"] = false
+			response["error"] = reviewErr.Error()
+		}
 	}
-	auditID := writeAudit(store, audit.Event{
-		Action:      "ssh.risk",
-		Target:      *targetID,
-		Params:      map[string]string{"command_sha256": hashSummary(*command)},
-		RiskLevel:   string(assessment.Level),
-		Decision:    string(assessment.Decision),
-		RiskReasons: assessment.Reasons,
-		OK:          true,
-		DurationMS:  time.Since(start).Milliseconds(),
-	})
+	addApprovalFields(response, approvalResult)
+	auditID := writeAudit(store, approvalAuditFields(audit.Event{
+		Action:     "ssh.risk",
+		Target:     *targetID,
+		Params:     map[string]string{"command_sha256": hashSummary(*command)},
+		OK:         reviewErr == nil,
+		DurationMS: time.Since(start).Milliseconds(),
+		ErrorClass: errorClass(reviewErr),
+	}, approvalResult))
 	response["audit_id"] = auditID
 	return writeValue(stdout, opts.Format, response)
 }
@@ -299,20 +339,36 @@ func runSSHRun(store config.Store, opts globalOptions, args []string, stdout io.
 		return writeError(stderr, fmt.Errorf("SSH 目标 %q 不存在", *targetID))
 	}
 	assessment := risk.ClassifySSHCommand(*command)
-	if assessment.Decision == risk.DecisionTemplateRequired {
-		return writeSSHAdhocDecision(store, opts, stdout, start, target.ID, *command, assessment, suggestedSSHTemplateCommand(target.ID, *command), 0)
-	}
-	if assessment.Decision == risk.DecisionDeny {
-		return writeSSHAdhocDecision(store, opts, stdout, start, target.ID, *command, assessment, "", 1)
-	}
-	adhocPolicy := target.NormalizedAdhocPolicy()
-	if !adhocPolicy.Enabled {
-		assessment = deniedByAdhocPolicy(assessment, "目标未开启 adhoc_policy，低风险临时执行被拒绝")
-		return writeSSHAdhocDecision(store, opts, stdout, start, target.ID, *command, assessment, "", 1)
-	}
-	if !risk.Allows(adhocPolicy.MaxRisk, assessment.Level) {
-		assessment = deniedByAdhocPolicy(assessment, fmt.Sprintf("目标 adhoc_policy 只允许最高风险等级 %s", adhocPolicy.MaxRisk))
-		return writeSSHAdhocDecision(store, opts, stdout, start, target.ID, *command, assessment, "", 1)
+	approvalCfg := cfg.NormalizedApproval()
+	approvalResult := classicApprovalResult(assessment)
+	var reviewErr error
+	if approvalCfg.Mode == config.ApprovalModeClassic {
+		if assessment.Decision == risk.DecisionTemplateRequired {
+			approvalResult.SuggestedTemplate = suggestedSSHTemplateCommand(target.ID, *command)
+			return writeSSHAdhocDecision(store, opts, stdout, start, target.ID, *command, approvalResult, 0, nil)
+		}
+		if assessment.Decision == risk.DecisionDeny {
+			return writeSSHAdhocDecision(store, opts, stdout, start, target.ID, *command, approvalResult, 1, nil)
+		}
+		adhocPolicy := target.NormalizedAdhocPolicy()
+		if !adhocPolicy.Enabled {
+			assessment = deniedByAdhocPolicy(assessment, "目标未开启 adhoc_policy，低风险临时执行被拒绝")
+			return writeSSHAdhocDecision(store, opts, stdout, start, target.ID, *command, classicApprovalResult(assessment), 1, nil)
+		}
+		if !risk.Allows(adhocPolicy.MaxRisk, assessment.Level) {
+			assessment = deniedByAdhocPolicy(assessment, fmt.Sprintf("目标 adhoc_policy 只允许最高风险等级 %s", adhocPolicy.MaxRisk))
+			return writeSSHAdhocDecision(store, opts, stdout, start, target.ID, *command, classicApprovalResult(assessment), 1, nil)
+		}
+	} else {
+		approvalResult, reviewErr = reviewExecution(context.Background(), cfg, approval.Request{
+			Operation:   approval.OperationSSHRun,
+			TargetID:    target.ID,
+			Command:     *command,
+			ClassicRisk: assessment,
+		})
+		if approvalResult.Decision != risk.DecisionAllow {
+			return writeSSHAdhocDecision(store, opts, stdout, start, target.ID, *command, approvalResult, 1, reviewErr)
+		}
 	}
 
 	secrets, _, err := loadExecutionSecrets(store)
@@ -329,21 +385,18 @@ func runSSHRun(store config.Store, opts globalOptions, args []string, stdout io.
 		"exit_code":   result.ExitCode,
 		"truncated":   result.Truncated,
 	}
-	addRiskFields(response, assessment)
+	addApprovalFields(response, approvalResult)
 	if execErr != nil {
 		response["error"] = execErr.Error()
 	}
-	auditID := writeAudit(store, audit.Event{
-		Action:      "ssh.run",
-		Target:      target.ID,
-		Params:      map[string]string{"command_sha256": hashSummary(*command)},
-		RiskLevel:   string(assessment.Level),
-		Decision:    string(assessment.Decision),
-		RiskReasons: assessment.Reasons,
-		OK:          execErr == nil,
-		DurationMS:  time.Since(start).Milliseconds(),
-		ErrorClass:  errorClass(execErr),
-	})
+	auditID := writeAudit(store, approvalAuditFields(audit.Event{
+		Action:     "ssh.run",
+		Target:     target.ID,
+		Params:     map[string]string{"command_sha256": hashSummary(*command)},
+		OK:         execErr == nil,
+		DurationMS: time.Since(start).Milliseconds(),
+		ErrorClass: errorClass(execErr),
+	}, approvalResult))
 	response["audit_id"] = auditID
 	writeValue(stdout, opts.Format, response)
 	if execErr != nil {
@@ -353,22 +406,20 @@ func runSSHRun(store config.Store, opts globalOptions, args []string, stdout io.
 }
 
 // writeSSHAdhocDecision 输出未执行 SSH 命令时的结构化风险结果并写审计。
-func writeSSHAdhocDecision(store config.Store, opts globalOptions, stdout io.Writer, start time.Time, targetID string, command string, assessment risk.Assessment, suggestion string, exitCode int) int {
+func writeSSHAdhocDecision(store config.Store, opts globalOptions, stdout io.Writer, start time.Time, targetID string, command string, approvalResult approval.Result, exitCode int, reviewErr error) int {
 	response := map[string]any{"ok": false, "target": targetID, "duration_ms": time.Since(start).Milliseconds()}
-	addRiskFields(response, assessment)
-	if suggestion != "" {
-		response["suggested_approval_command"] = suggestion
+	addApprovalFields(response, approvalResult)
+	if reviewErr != nil {
+		response["error"] = reviewErr.Error()
 	}
-	auditID := writeAudit(store, audit.Event{
-		Action:      "ssh.run",
-		Target:      targetID,
-		Params:      map[string]string{"command_sha256": hashSummary(command)},
-		RiskLevel:   string(assessment.Level),
-		Decision:    string(assessment.Decision),
-		RiskReasons: assessment.Reasons,
-		OK:          false,
-		DurationMS:  time.Since(start).Milliseconds(),
-	})
+	auditID := writeAudit(store, approvalAuditFields(audit.Event{
+		Action:     "ssh.run",
+		Target:     targetID,
+		Params:     map[string]string{"command_sha256": hashSummary(command)},
+		OK:         false,
+		DurationMS: time.Since(start).Milliseconds(),
+		ErrorClass: errorClass(reviewErr),
+	}, approvalResult))
 	response["audit_id"] = auditID
 	writeValue(stdout, opts.Format, response)
 	return exitCode
